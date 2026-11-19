@@ -10,13 +10,14 @@ Source code for the Medium article:
 
 Benchmark Kiri and Podman on Linux. In the published experiments, both
 engines were tested on the SAME VM for each distribution. The identical
-Python script was run without code changes on Fedora 45 and CachyOS.
+Python script was run without code changes on Fedora 45, CachyOS, and
+Lubuntu 26.04 LTS, with a CLI-path override where required.
 
-This updated version also supports Lubuntu 26.04. It explicitly uses Kiri's
-bundled Docker CLI with Kiri's own Unix socket, not the `docker` command in
-PATH (which can be a Podman compatibility wrapper on Lubuntu). It verifies
-that the remote server identifies itself as Kiri BEFORE any measurement.
-The benchmark still tests the same operations and image.
+The script explicitly uses Kiri's bundled Docker CLI with Kiri's own Unix
+socket, not the `docker` command in PATH (which can be a Podman compatibility
+wrapper on Lubuntu). It verifies that the remote server identifies itself
+as Kiri BEFORE any measurement. The same operations and image are used
+for both engines.
 
 Fedora 45:
     python3 compare_kiri_podman_vms.py --engine kiri \
@@ -28,6 +29,7 @@ Fedora 45:
 
 CachyOS:
     python3 compare_kiri_podman_vms.py --engine kiri \
+        --kiri-cli /usr/lib/kiri/docker \
         --runs 30 --output kiri_cachyos.json
     python3 compare_kiri_podman_vms.py --engine podman \
         --runs 30 --output podman_cachyos.json
@@ -86,7 +88,8 @@ DEFAULT_RUNS = 15
 DEFAULT_WARMUPS = 3
 COMMAND_TIMEOUT = 120
 
-# Kiri's bundled Docker CLI and Linux engine socket (Kiri 0.2.1 full package).
+# Default bundled Docker CLI path and Linux engine socket for Kiri 0.2.1.
+# The CLI path may differ by distribution; use --kiri-cli to override it.
 # Do not use a Docker/Podman compatibility wrapper from PATH for Kiri runs.
 DEFAULT_KIRI_CLI = "/usr/libexec/kiri/docker"
 KIRI_SOCKET = "/run/kiri/docker.sock"
@@ -178,10 +181,11 @@ def resolve_engine_command(engine, kiri_cli=None):
     """
     Return an unambiguous command prefix for the selected engine.
 
-    Kiri 0.2.1 on Linux ships a Docker client in /usr/libexec/kiri.
+    The default Kiri 0.2.1 Docker client path is /usr/libexec/kiri/docker.
+    The CachyOS package uses /usr/lib/kiri/docker in the tested setup.
     Explicitly targeting Kiri's socket avoids the Podman `docker` shim
-    found on systems such as Lubuntu 26.04. The user may override the
-    bundled-client path for custom installations with --kiri-cli.
+    found on systems such as Lubuntu 26.04. Use --kiri-cli when the
+    bundled-client path differs from the default.
     """
 
     if engine == "podman":
@@ -428,8 +432,8 @@ def run_suite(engine, runs, warmups, output, kiri_cli=None):
     # Each execution creates a container, runs /bin/true,
     # waits for termination, and removes the container.
     #
-    # --network none ensures the container workload does not
-    # depend on network initialization.
+    # --network none disables external container networking.
+    # Engine-specific setup for this network mode may still be timed.
 
     run_command = command_prefix + [
         "run",
