@@ -6,6 +6,8 @@ A lightweight, reproducible Python tool for comparing **Kiri** and **Podman** co
 
 **Purpose:** Provide a tool, **not a verdict** about which container engine is better. Run it on your system and evaluate the results yourself.
 
+**Related article on Medium:** [Kiri vs. Podman on Linux: A Python Benchmarking Tool for Different Distributions](https://medium.com/@anatolykrivitsky/kiri-vs-podman-on-linux-a-python-benchmarking-tool-for-different-distributions-75878ba68418)
+
 ## What it measures
 
 The script [`compare_kiri_podman_vms.py`](compare_kiri_podman_vms.py) times two complete CLI operations:
@@ -110,7 +112,6 @@ Permission is granted, free of charge, to use, copy, distribute, and publish thi
 This code is provided "as is", without warranty of any kind. The user assumes all responsibility and risk for its use. Under no circumstances shall the author be liable for damages, lost profits, data loss, business interruption, or other losses arising from the use of, inability to use, or reliance on this code.
 
 See `LICENSE` for complete usage terms.
-
 
 ## Contact
 
