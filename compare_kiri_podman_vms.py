@@ -2,53 +2,12 @@
 # -*- coding: utf-8 -*-
 r"""
 Kiri vs. Podman: Container Lifecycle Performance Benchmark
-
+Version 1.1.0 | JSON schema 2 | Python 3.10+
 Author: Anatoly S. Krivitsky, Ph.D.
 
-Source code for the Medium article:
-"Kiri vs. Podman on Linux: Benchmarking Container Lifecycle Performance with Python"
-
-Benchmark Kiri and Podman on Linux. In the published experiments, both
-engines were tested on the SAME VM for each distribution. The identical
-Python script was run without code changes on Fedora 45, CachyOS, and
-Lubuntu 26.04 LTS, with a CLI-path override where required.
-
-The script explicitly uses Kiri's bundled Docker CLI with Kiri's own Unix
-socket, not the `docker` command in PATH (which can be a Podman compatibility
-wrapper on Lubuntu). It verifies that the remote server identifies itself
-as Kiri BEFORE any measurement. The same operations and image are used
-for both engines.
-
-Fedora 45:
-    python3 compare_kiri_podman_vms.py --engine kiri \
-        --runs 30 --output kiri_fedora45.json
-    python3 compare_kiri_podman_vms.py --engine podman \
-        --runs 30 --output podman_fedora45.json
-    python3 compare_kiri_podman_vms.py --compare \
-        kiri_fedora45.json podman_fedora45.json
-
-CachyOS:
-    python3 compare_kiri_podman_vms.py --engine kiri \
-        --kiri-cli /usr/lib/kiri/docker \
-        --runs 30 --output kiri_cachyos.json
-    python3 compare_kiri_podman_vms.py --engine podman \
-        --runs 30 --output podman_cachyos.json
-    python3 compare_kiri_podman_vms.py --compare \
-        kiri_cachyos.json podman_cachyos.json
-
-Lubuntu 26.04:
-    python3 compare_kiri_podman_vms.py --engine kiri \
-        --runs 30 --output kiri_lubuntu2604.json
-    python3 compare_kiri_podman_vms.py --engine podman \
-        --runs 30 --output podman_lubuntu2604.json
-    python3 compare_kiri_podman_vms.py --compare \
-        kiri_lubuntu2604.json podman_lubuntu2604.json
-
-Requirements:
-    Python 3.10+
-    Kiri or Podman installed and operational
-    Internet access for the initial image pull
-    No third-party Python packages required.
+Run both engines on the same Linux VM for a controlled comparison.
+The original workloads and timing method are retained. No external Python
+packages are required. Internet access is needed for the image pull.
 
 Copyright (c) 2026 Anatoly S. Krivitsky, Ph.D.
 All rights reserved.
@@ -56,690 +15,390 @@ All rights reserved.
 Permission is granted, free of charge, to use, copy, distribute, and publish
 this code, provided that this copyright notice and permission notice are
 preserved.
-
 This code is provided "as is", without warranty of any kind. The user assumes
 all responsibility and risk for its use. Under no circumstances shall the
 author be liable for any direct, indirect, incidental, special, consequential,
 exemplary, or punitive damages, lost profits, data loss, or other losses
 arising from the use of, inability to use, or reliance on this code.
 
-Questions and comments:
-    akrivitsky.dev@proton.me
-
+Questions and comments: akrivitsky.dev@proton.me
 See LICENSE for complete usage terms.
 """
-
 import argparse
 import json
+import math
+import os
 import platform
+import re
+import shlex
 import shutil
 import statistics
 import subprocess
 import sys
 import time
-
 from datetime import datetime, timezone
 from pathlib import Path
 
-
+BENCHMARK_VERSION = "1.1.0"
+SCHEMA_VERSION = 2
 IMAGE = "docker.io/library/alpine:3.22"
-
 DEFAULT_RUNS = 15
 DEFAULT_WARMUPS = 3
 COMMAND_TIMEOUT = 120
-
-# Default bundled Docker CLI path and Linux engine socket for Kiri 0.2.1.
-# The CLI path may differ by distribution; use --kiri-cli to override it.
-# Do not use a Docker/Podman compatibility wrapper from PATH for Kiri runs.
-DEFAULT_KIRI_CLI = "/usr/libexec/kiri/docker"
 KIRI_SOCKET = "/run/kiri/docker.sock"
+KIRI_CLI_PATHS = ("/usr/libexec/kiri/docker", "/usr/lib/kiri/docker")
 
 
-# ------------------------------------------------------------
-# Command execution
-# ------------------------------------------------------------
+def warn(message):
+    print(f"WARNING: {message}", file=sys.stderr)
+
 
 def execute(command, timeout=COMMAND_TIMEOUT):
-    """
-    Execute a command and capture its output.
-
-    Returns:
-        CompletedProcess instance.
-
-    Raises:
-        RuntimeError on command failure.
-    """
-
     result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False
+        command, capture_output=True, text=True, timeout=timeout, check=False
     )
-
     if result.returncode != 0:
         raise RuntimeError(
-            f"Command failed: {' '.join(command)}\n"
+            f"Command failed: {shlex.join(command)}\n"
             f"Exit code: {result.returncode}\n"
-            f"STDOUT:\n{result.stdout}\n"
-            f"STDERR:\n{result.stderr}"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
-
     return result
 
 
 def timed_execute(command):
-    """
-    Execute a command and measure elapsed wall-clock time.
-
-    Returns elapsed time in milliseconds.
-    """
-
     start = time.perf_counter_ns()
-
     execute(command)
-
     end = time.perf_counter_ns()
-
     return (end - start) / 1_000_000
 
 
-# ------------------------------------------------------------
-# Engine detection
-# ------------------------------------------------------------
-
 def detect_engine():
-    """
-    Detect the installed container engine.
-
-    Works on Fedora 45, CachyOS, and other Linux distributions.
-    Specify --engine when both Kiri and Podman are installed.
-    """
-
-    has_kiri = shutil.which("kiri") is not None
-    has_podman = shutil.which("podman") is not None
-
-    if has_kiri and not has_podman:
-        return "kiri"
-
-    if has_podman and not has_kiri:
-        return "podman"
-
-    if has_kiri and has_podman:
-        raise RuntimeError(
-            "Both Kiri and Podman were detected. "
-            "Specify --engine kiri or --engine podman."
-        )
-
-    raise RuntimeError(
-        "Neither Kiri nor Podman was found in PATH."
-    )
+    engines = [e for e in ("kiri", "podman") if shutil.which(e)]
+    if len(engines) != 1:
+        raise RuntimeError("Specify --engine kiri or --engine podman; "
+                           f"detected: {', '.join(engines) or 'neither'}.")
+    return engines[0]
 
 
-def resolve_engine_command(engine, kiri_cli=None):
-    """
-    Return an unambiguous command prefix for the selected engine.
-
-    The default Kiri 0.2.1 Docker client path is /usr/libexec/kiri/docker.
-    The CachyOS package uses /usr/lib/kiri/docker in the tested setup.
-    Explicitly targeting Kiri's socket avoids the Podman `docker` shim
-    found on systems such as Lubuntu 26.04. Use --kiri-cli when the
-    bundled-client path differs from the default.
-    """
-
+def resolve_engine_command(engine, kiri_cli=None, kiri_socket=KIRI_SOCKET):
     if engine == "podman":
         executable = shutil.which("podman")
-        if executable is None:
+        if not executable:
             raise RuntimeError("Podman executable not found in PATH.")
         return [executable]
+    if engine != "kiri":
+        raise ValueError(f"Unknown engine: {engine}")
+    if not shutil.which("kiri"):
+        raise RuntimeError("Kiri executable not found in PATH.")
+    if not Path(kiri_socket).is_absolute():
+        raise ValueError("--kiri-socket requires an absolute filesystem path.")
+    for candidate in ((kiri_cli,) if kiri_cli else KIRI_CLI_PATHS):
+        path = Path(candidate).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return [str(path.resolve()), "-H", f"unix://{kiri_socket}"]
+    raise RuntimeError("Kiri's bundled Docker CLI not found or not executable. "
+                       "Use --kiri-cli with the genuine bundled client.")
 
+
+def parse_kiri_version(output):
+    """Parse named sections; never mistake the compatibility version for Kiri."""
+    if not any(line.strip().casefold() == "server: kiri"
+               for line in output.splitlines()):
+        raise RuntimeError("Endpoint did not identify itself as Server: Kiri.\n"
+                           + output)
+    fields = {"client": {}, "engine": {}, "kiri": {}}
+    section = None
+    for line in output.splitlines():
+        line = line.strip()
+        if line.casefold() == "server: kiri":
+            section = None
+        elif line.casefold() in ("client:", "engine:", "kiri:"):
+            section = line[:-1].casefold()
+        elif section and ":" in line:
+            key, value = line.split(":", 1)
+            fields[section][key.strip().casefold()] = value.strip()
+    version = fields["kiri"].get("version")
+    if not version:
+        raise RuntimeError("Kiri product version missing from server response.\n"
+                           + output)
+    client_api = fields["client"].get("api version", "")
+    downgrade = re.search(r"downgraded from\s+([^\s)]+)", client_api)
+    return {
+        "engine_version": version,
+        "client_version": fields["client"].get("version"),
+        "compatibility_engine_version": fields["engine"].get("version"),
+        "api_version": client_api.split()[0] if client_api else None,
+        "client_max_api_version": downgrade.group(1) if downgrade else None,
+        "server_api_version": fields["engine"].get("api version"),
+        "rootless": None,
+        "version_output": output,
+    }
+
+
+def get_engine_metadata(engine, prefix):
     if engine == "kiri":
-        if shutil.which("kiri") is None:
-            raise RuntimeError("Kiri executable not found in PATH.")
+        raw = execute(prefix + ["version"], timeout=30).stdout
+        meta = parse_kiri_version(raw)
+        try:
+            options = json.loads(execute(
+                prefix + ["info", "--format", "{{json .SecurityOptions}}"], 30
+            ).stdout)
+            if isinstance(options, list) and any(
+                "rootless" in str(option).casefold() for option in options
+            ):
+                meta["rootless"] = True
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired, OSError):
+            pass  # A Docker-compatible server need not implement all info fields.
+        return meta
 
-        client = Path(kiri_cli or DEFAULT_KIRI_CLI)
-        if not client.is_file():
-            raise RuntimeError(
-                f"Kiri's bundled Docker client was not found: {client}. "
-                "Use --kiri-cli /path/to/a/real/docker-client if your "
-                "Kiri package installs it elsewhere. Do not use Podman's "
-                "docker compatibility wrapper."
-            )
-
-        import os
-        if not os.access(client, os.X_OK):
-            raise RuntimeError(f"Kiri Docker client is not executable: {client}")
-
-        return [str(client.resolve()), "-H", f"unix://{KIRI_SOCKET}"]
-
-    raise ValueError(f"Unknown engine: {engine}")
-
-
-def verify_kiri_server(command_prefix):
-    """Fail closed if the Docker-compatible endpoint is not Kiri."""
-
-    result = execute(command_prefix + ["version"], timeout=30)
-    if not any(
-        line.strip().casefold().startswith("server: kiri")
-        for line in result.stdout.splitlines()
-    ):
-        raise RuntimeError(
-            "The target endpoint did not identify itself as 'Server: Kiri'. "
-            "Aborting to avoid accidentally benchmarking Podman or Docker. "
-            f"Command: {' '.join(command_prefix)} version\n"
-            f"Output:\n{result.stdout}\n{result.stderr}"
-        )
+    raw = execute(prefix + ["version", "--format", "json"], 30).stdout
+    data = json.loads(raw)
+    client = data.get("Client") or data.get("client") or {}
+    server = data.get("Server") or data.get("server") or {}
+    client_version = client.get("Version") or client.get("version")
+    server_version = server.get("Version") or server.get("version")
+    version = server_version or client_version
+    if not version:
+        raise RuntimeError("Podman version missing from JSON response.\n" + raw)
+    meta = {
+        "engine_version": version,
+        "client_version": client_version,
+        "compatibility_engine_version": None,
+        "api_version": (server or client).get("APIVersion"),
+        "server_api_version": server.get("APIVersion"),
+        "rootless": None,
+        "version_output": data,
+    }
+    try:
+        info = json.loads(execute(prefix + ["info", "--format", "json"], 30).stdout)
+        rootless = info.get("host", {}).get("security", {}).get("rootless")
+        if isinstance(rootless, bool):
+            meta["rootless"] = rootless
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired, OSError):
+        pass
+    return meta
 
 
-def default_output_filename(engine):
-    """Generate a distribution-specific filename when --output is omitted."""
-
+def get_system_information():
     try:
         distro = platform.freedesktop_os_release()
     except OSError:
         distro = {}
+    memory = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                memory = int(line.split()[1])
+                break
+    except (OSError, ValueError):
+        pass
+    return {
+        "hostname": platform.node(), "kernel": platform.release(),
+        "architecture": platform.machine(),
+        "python_version": platform.python_version(),
+        "cpu_count": os.cpu_count(), "memory_total_kib": memory,
+        "distribution": distro.get("NAME"),
+        "distribution_id": distro.get("ID"),
+        "distribution_version": distro.get("VERSION_ID"),
+        "distribution_pretty_name": distro.get("PRETTY_NAME"),
+        "effective_uid": os.geteuid() if hasattr(os, "geteuid") else None,
+    }
 
-    distro_id = "".join(
-        ch for ch in distro.get("ID", "linux").lower()
-        if ch.isalnum()
-    ) or "linux"
-    version = "".join(
-        ch for ch in distro.get("VERSION_ID", "")
-        if ch.isalnum()
-    )
-    return f"{engine}_{distro_id}{version}.json"
+
+def inspect_image(prefix):
+    """Collect identity outside the timed workload; unavailable fields stay null."""
+    metadata = {"id": None, "repo_digests": [], "digest": None,
+                "architecture": None, "os": None}
+    try:
+        data = json.loads(execute(prefix + ["image", "inspect", IMAGE], 30).stdout)
+        item = data[0] if isinstance(data, list) else data
+        metadata.update({
+            "id": item.get("Id") or item.get("ID"),
+            "repo_digests": item.get("RepoDigests") or [],
+            "digest": item.get("Digest") or None,
+            "architecture": item.get("Architecture"),
+            "os": item.get("Os") or item.get("OS"),
+        })
+    except (RuntimeError, ValueError, OSError, IndexError,
+            TypeError, AttributeError, subprocess.TimeoutExpired) as error:
+        warn(f"Image inspection unavailable: {error}")
+    if not (metadata["repo_digests"] or metadata["digest"]):
+        warn("No repository digest reported; exact image equivalence is unverified.")
+    return metadata
 
 
-# ------------------------------------------------------------
-# Benchmark utilities
-# ------------------------------------------------------------
+def default_output_filename(engine, version, system):
+    safe = lambda value: re.sub(r"[^a-zA-Z0-9._-]", "_", str(value))
+    distro = re.sub(r"[^a-zA-Z0-9]", "", system.get("distribution_id") or "linux")
+    release = re.sub(r"[^a-zA-Z0-9]", "", system.get("distribution_version") or "")
+    return f"{engine}_{safe(version)}_{distro}{release}.json"
+
 
 def calculate_statistics(times):
-    """
-    Calculate timing statistics in milliseconds.
-    """
-
     return {
-        "count": len(times),
-        "minimum_ms": min(times),
-        "maximum_ms": max(times),
-        "mean_ms": statistics.mean(times),
-        "median_ms": statistics.median(times),
-        "stdev_ms": (
-            statistics.stdev(times)
-            if len(times) > 1
-            else 0.0
-        ),
-        "samples_ms": times
+        "count": len(times), "minimum_ms": min(times), "maximum_ms": max(times),
+        "mean_ms": statistics.mean(times), "median_ms": statistics.median(times),
+        "stdev_ms": statistics.stdev(times) if len(times) > 1 else 0.0,
+        "samples_ms": times,
     }
 
 
 def benchmark(name, command, warmups, runs):
-    """
-    Benchmark one command.
-
-    Warm-up executions are excluded from results.
-    """
-
-    print(f"\n{'=' * 65}")
-    print(f"Benchmark: {name}")
-    print(f"Command: {' '.join(command)}")
-    print(f"{'=' * 65}")
-
-    print(f"\nPerforming {warmups} warm-up executions...")
-
+    print(f"\n{'=' * 65}\nBenchmark: {name}\nCommand: {shlex.join(command)}")
     for i in range(warmups):
         timed_execute(command)
         print(f"  Warm-up {i + 1}/{warmups}: OK")
-
-    print(f"\nPerforming {runs} measured executions...")
-
     samples = []
-
     for i in range(runs):
         elapsed = timed_execute(command)
-
         samples.append(elapsed)
-
-        print(
-            f"  Run {i + 1:2d}/{runs}: "
-            f"{elapsed:10.3f} ms"
-        )
-
+        print(f"  Run {i + 1:2d}/{runs}: {elapsed:10.3f} ms")
     stats = calculate_statistics(samples)
-
-    print("\nResults:")
-    print(f"  Minimum: {stats['minimum_ms']:.3f} ms")
-    print(f"  Maximum: {stats['maximum_ms']:.3f} ms")
-    print(f"  Mean:    {stats['mean_ms']:.3f} ms")
-    print(f"  Median:  {stats['median_ms']:.3f} ms")
-    print(f"  Std dev: {stats['stdev_ms']:.3f} ms")
-
+    for label, key in (("Minimum", "minimum_ms"), ("Maximum", "maximum_ms"),
+                       ("Mean", "mean_ms"), ("Median", "median_ms"),
+                       ("Std dev", "stdev_ms")):
+        print(f"  {label:8s}: {stats[key]:.3f} ms")
     return stats
 
 
-# ------------------------------------------------------------
-# System information
-# ------------------------------------------------------------
-
-def get_system_information():
-    """
-    Collect information about the current VM.
-    """
-
-    information = {
-        "hostname": platform.node(),
-        "kernel": platform.release(),
-        "architecture": platform.machine(),
-        "python_version": platform.python_version(),
-        "cpu_count": None,
-        "memory_total_kib": None
-    }
-
-    try:
-        import os
-
-        information["cpu_count"] = os.cpu_count()
-
-        with open(
-            "/proc/meminfo",
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            for line in file:
-                if line.startswith("MemTotal:"):
-                    information["memory_total_kib"] = int(
-                        line.split()[1]
-                    )
-                    break
-
-    except (OSError, ValueError):
-        pass
-
-    return information
-
-
-# ------------------------------------------------------------
-# Run benchmark suite
-# ------------------------------------------------------------
-
-def run_suite(engine, runs, warmups, output, kiri_cli=None):
-    """
-    Run the complete benchmark suite on the current VM.
-    """
-
-    command_prefix = resolve_engine_command(engine, kiri_cli=kiri_cli)
-    executable = command_prefix[0]
-
-    print("\n" + "=" * 65)
-    print("KIRI vs PODMAN CONTAINER LIFECYCLE BENCHMARK")
-    print("=" * 65)
-
-    print(f"Engine:      {engine}")
-    print(f"Executable:  {executable}")
-    print(f"CLI prefix:  {' '.join(command_prefix)}")
-    print(f"Hostname:    {platform.node()}")
-    print(f"Kernel:      {platform.release()}")
-    print(f"Image:       {IMAGE}")
-    print(f"Runs:        {runs}")
-    print(f"Warm-ups:    {warmups}")
-
-    # --------------------------------------------------------
-    # Check engine availability
-    # --------------------------------------------------------
-
-    print("\nChecking container engine...")
-
-    if engine == "kiri":
-        verify_kiri_server(command_prefix)
-        print("Verified: Docker-compatible server is Kiri.")
-
-    execute(command_prefix + ["ps"], timeout=30)
-
-    print("Container engine is responding.")
-
-    # --------------------------------------------------------
-    # Pull the same image before timing begins
-    # --------------------------------------------------------
-
-    print(f"\nPreparing container image: {IMAGE}")
-    print("This download is NOT included in benchmark timings.")
-
-    execute(
-        command_prefix + ["pull", IMAGE],
-        timeout=600
-    )
-
-    print("Container image is ready.")
-
-    # --------------------------------------------------------
-    # Benchmark 1: CLI container listing
-    # --------------------------------------------------------
-
-    ps_results = benchmark(
-        name="Container listing",
-        command=command_prefix + ["ps"],
-        warmups=warmups,
-        runs=runs
-    )
-
-    # --------------------------------------------------------
-    # Benchmark 2: Container creation and execution
-    # --------------------------------------------------------
-
-    # Each execution creates a container, runs /bin/true,
-    # waits for termination, and removes the container.
-    #
-    # --network none disables external container networking.
-    # Engine-specific setup for this network mode may still be timed.
-
-    run_command = command_prefix + [
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        IMAGE,
-        "/bin/true"
-    ]
-
-    startup_results = benchmark(
-        name="Container startup and execution",
-        command=run_command,
-        warmups=warmups,
-        runs=runs
-    )
-
-    # --------------------------------------------------------
-    # Build result document
-    # --------------------------------------------------------
-
+def run_suite(engine, runs, warmups, output=None, kiri_cli=None,
+              kiri_socket=KIRI_SOCKET, overwrite=False):
+    prefix = resolve_engine_command(engine, kiri_cli, kiri_socket)
+    meta = get_engine_metadata(engine, prefix)
+    system = get_system_information()
+    version = meta["engine_version"]
+    path = Path(output or default_output_filename(engine, version, system))
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Results already exist: {path}. "
+                              "Choose --output or explicitly use --overwrite.")
+    print(f"\nKIRI vs PODMAN | Benchmark {BENCHMARK_VERSION}")
+    print(f"Engine: {engine} {version}\nCLI: {shlex.join(prefix)}")
+    print(f"System: {system['distribution_pretty_name']} / {system['kernel']}")
+    print(f"Image: {IMAGE}\nRuns: {runs}\nWarm-ups: {warmups}")
+    execute(prefix + ["ps"], timeout=30)
+    print("\nPreparing image (not timed)...")
+    execute(prefix + ["pull", IMAGE], timeout=600)
+    image_metadata = inspect_image(prefix)
+    if meta["rootless"] is None:
+        warn("Engine rootless status unavailable; it will be recorded as null.")
+    # Keep both original measured commands and their order unchanged.
+    commands = {"ps": prefix + ["ps"],
+                "run": prefix + ["run", "--rm", "--network", "none", IMAGE, "/bin/true"]}
+    ps_results = benchmark("Container listing", commands["ps"], warmups, runs)
+    run_results = benchmark("Container startup and execution", commands["run"], warmups, runs)
     results = {
-        "schema_version": 1,
-        "timestamp_utc": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "engine": engine,
-        "engine_executable": executable,
-        "engine_command_prefix": command_prefix,
-        "kiri_socket": KIRI_SOCKET if engine == "kiri" else None,
-        "image": IMAGE,
-        "runs": runs,
-        "warmups": warmups,
-        "system": get_system_information(),
-        "benchmarks": {
-            "ps": ps_results,
-            "run": startup_results
-        }
+        "schema_version": SCHEMA_VERSION, "benchmark_version": BENCHMARK_VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "engine": engine, "engine_version": version, "engine_metadata": meta,
+        "engine_executable": prefix[0], "engine_command_prefix": prefix,
+        "kiri_socket": kiri_socket if engine == "kiri" else None,
+        "image": IMAGE, "image_metadata": image_metadata,
+        "runs": runs, "warmups": warmups, "system": system,
+        "benchmark_commands": commands,
+        "benchmarks": {"ps": ps_results, "run": run_results},
     }
-
-    # --------------------------------------------------------
-    # Save results
-    # --------------------------------------------------------
-
-    output_path = Path(output)
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    output_path.write_text(
-        json.dumps(
-            results,
-            indent=2,
-            ensure_ascii=False
-        ),
-        encoding="utf-8"
-    )
-
-    print("\n" + "=" * 65)
-    print("BENCHMARK COMPLETED SUCCESSFULLY")
-    print("=" * 65)
-
-    print(f"\nResults saved to: {output_path.resolve()}")
-
-    print("\nSummary:")
-
-    print(
-        f"  Container listing median: "
-        f"{ps_results['median_ms']:.3f} ms"
-    )
-
-    print(
-        f"  Container execution median: "
-        f"{startup_results['median_ms']:.3f} ms"
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w" if overwrite else "x", encoding="utf-8") as file:
+        json.dump(results, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+    print(f"\nBENCHMARK COMPLETED\nResults: {path.resolve()}")
+    print(f"  Listing median:   {ps_results['median_ms']:.3f} ms")
+    print(f"  Execution median: {run_results['median_ms']:.3f} ms")
 
 
-# ------------------------------------------------------------
-# Compare results from two benchmark runs (ideally on the same VM)
-# ------------------------------------------------------------
+def read_results(filename):
+    data = json.loads(Path(filename).read_text(encoding="utf-8"))
+    if data.get("schema_version", 1) not in (1, 2):
+        raise ValueError(f"Unsupported JSON schema: {filename}")
+    return data
+
+
+def image_digests(result):
+    meta = result.get("image_metadata") or {}
+    return {value.rsplit("@", 1)[-1].lower()
+            for value in (meta.get("repo_digests") or []) + [meta.get("digest")]
+            if isinstance(value, str) and re.fullmatch(
+                r"sha256:[0-9a-fA-F]{64}", value.rsplit("@", 1)[-1])}
+
+
+def check_comparability(first, second):
+    if first["image"] != second["image"]:
+        raise RuntimeError("Benchmarks used different image references.")
+    a, b = image_digests(first), image_digests(second)
+    if not a or not b:
+        warn("One or both image digests are missing; image identity is unverified.")
+    elif not a.intersection(b):
+        warn("No shared repository digest; image content may differ (index vs manifest also possible).")
+    for key in ("id", "architecture", "os"):
+        x = (first.get("image_metadata") or {}).get(key)
+        y = (second.get("image_metadata") or {}).get(key)
+        if key == "id" and isinstance(x, str) and isinstance(y, str):
+            x, y = x.removeprefix("sha256:"), y.removeprefix("sha256:")
+        if x is not None and y is not None and x != y:
+            warn(f"Image {key} differs: {x} vs {y}.")
+    for key in ("hostname", "kernel", "architecture", "cpu_count", "memory_total_kib",
+                "distribution_id", "distribution_version", "python_version"):
+        x, y = first["system"].get(key), second["system"].get(key)
+        if x is not None and y is not None and x != y:
+            warn(f"System {key} differs: {x} vs {y}.")
+    for key in ("runs", "warmups", "benchmark_version"):
+        if first.get(key) != second.get(key):
+            warn(f"{key} differs: {first.get(key)} vs {second.get(key)}.")
+    x = (first.get("engine_metadata") or {}).get("rootless")
+    y = (second.get("engine_metadata") or {}).get("rootless")
+    if x is None or y is None:
+        warn("Rootless/rootful equivalence is unverified.")
+    elif x != y:
+        warn(f"Engine rootless status differs: {x} vs {y}.")
+
 
 def compare_results(first_file, second_file):
-    """
-    Compare benchmark JSON results from two runs.
+    first, second = read_results(first_file), read_results(second_file)
+    check_comparability(first, second)
+    labels = [f"{r['engine']} {r.get('engine_version') or 'unknown'}" for r in (first, second)]
+    print("\nKIRI vs PODMAN BENCHMARK COMPARISON")
+    for i, result in enumerate((first, second)):
+        print(f"  {labels[i]} | {result['system']['hostname']} | {result['system']['kernel']}")
+    print(f"\n{'Operation':<24}{labels[0]:>20}{labels[1]:>20}{'Difference':>15}")
+    for key, label in (("ps", "Container listing"), ("run", "Container execution")):
+        a, b = (float(r["benchmarks"][key]["median_ms"]) for r in (first, second))
+        if not all(math.isfinite(v) and v > 0 for v in (a, b)):
+            raise ValueError(f"Invalid median for {key}.")
+        difference = (a - b) / b * 100
+        print(f"{label:<24}{a:>20.3f}{b:>20.3f}{difference:>+14.1f}%")
+        winner = labels[0] if a < b else labels[1] if b < a else "Tie"
+        print(f"  Faster: {winner} ({max(a, b) / min(a, b):.2f}x)")
+    print("\nTimes are milliseconds; difference is relative to the second result.")
+    print("These are end-to-end CLI measurements, not isolated engine timings.")
 
-    For a controlled engine comparison, run both engines on the same VM.
-    """
-
-    first_path = Path(first_file)
-    second_path = Path(second_file)
-
-    for path in (first_path, second_path):
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"Benchmark file not found: {path.resolve()}\n"
-                "Run the benchmark on that VM first, then "
-                "copy its JSON file to this directory."
-            )
-
-    first = json.loads(
-        first_path.read_text(encoding="utf-8")
-    )
-
-    second = json.loads(
-        second_path.read_text(encoding="utf-8")
-    )
-
-    if first["image"] != second["image"]:
-        raise RuntimeError(
-            "The benchmarks used different container images."
-        )
-
-    print("\n" + "=" * 78)
-    print("KIRI vs PODMAN BENCHMARK COMPARISON")
-    print("=" * 78)
-
-    print(
-        f"\nSystem 1: {first['engine']} / "
-        f"{first['system']['hostname']}"
-    )
-
-    print(
-        f"  Kernel: {first['system']['kernel']}"
-    )
-
-    print(
-        f"\nSystem 2: {second['engine']} / "
-        f"{second['system']['hostname']}"
-    )
-
-    print(
-        f"  Kernel: {second['system']['kernel']}"
-    )
-
-    print("\nMedian execution times (milliseconds):\n")
-
-    print(
-        f"{'Operation':<28}"
-        f"{first['engine']:>15}"
-        f"{second['engine']:>15}"
-        f"{'Difference':>17}"
-    )
-
-    print("-" * 78)
-
-    labels = {
-        "ps": "Container listing",
-        "run": "Container execution"
-    }
-
-    for key, label in labels.items():
-
-        first_time = first[
-            "benchmarks"
-        ][key]["median_ms"]
-
-        second_time = second[
-            "benchmarks"
-        ][key]["median_ms"]
-
-        difference = (
-            (first_time - second_time)
-            / second_time
-            * 100
-        )
-
-        print(
-            f"{label:<28}"
-            f"{first_time:>15.3f}"
-            f"{second_time:>15.3f}"
-            f"{difference:>+16.1f}%"
-        )
-
-        if first_time < second_time:
-            winner = first["engine"]
-            factor = second_time / first_time
-        elif second_time < first_time:
-            winner = second["engine"]
-            factor = first_time / second_time
-        else:
-            winner = "Tie"
-            factor = 1.0
-
-        print(
-            f"  Faster: {winner} "
-            f"({factor:.2f}x)"
-        )
-
-    print("\n" + "=" * 78)
-
-    print(
-        "\nNOTE: These measurements compare complete VM "
-        "configurations, not isolated container engines."
-    )
-
-
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
 
 def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark Kiri and Podman on the same Linux VM, "
-            "including Fedora 45, CachyOS, and Lubuntu 26.04."
-        )
-    )
-
-    parser.add_argument(
-        "--engine",
-        choices=["kiri", "podman"],
-        help="Container engine to benchmark."
-    )
-
-    parser.add_argument(
-        "--kiri-cli",
-        help=(
-            "Path to Kiri's genuine Docker CLI "
-            f"(default: {DEFAULT_KIRI_CLI}). "
-            "Do not point this to Podman's docker compatibility shim."
-        )
-    )
-
-    parser.add_argument(
-        "--runs",
-        type=int,
-        default=DEFAULT_RUNS,
-        help="Number of measured runs (default: 15)."
-    )
-
-    parser.add_argument(
-        "--warmups",
-        type=int,
-        default=DEFAULT_WARMUPS,
-        help="Number of warm-up runs (default: 3)."
-    )
-
-    parser.add_argument(
-        "--output",
-        help="Output JSON filename."
-    )
-
-    parser.add_argument(
-        "--compare",
-        nargs=2,
-        metavar=("KIRI_JSON", "PODMAN_JSON"),
-        help="Compare two previously generated JSON files."
-    )
-
+    parser = argparse.ArgumentParser(description="Kiri vs. Podman lifecycle benchmark")
+    parser.add_argument("--version", action="version", version=BENCHMARK_VERSION)
+    parser.add_argument("--engine", choices=("kiri", "podman"))
+    parser.add_argument("--kiri-cli", help="Override bundled Kiri Docker CLI path")
+    parser.add_argument("--kiri-socket", default=KIRI_SOCKET)
+    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
+    parser.add_argument("--warmups", type=int, default=DEFAULT_WARMUPS)
+    parser.add_argument("--output", help="Output JSON filename")
+    parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing results")
+    parser.add_argument("--compare", nargs=2, metavar=("FIRST_JSON", "SECOND_JSON"))
     args = parser.parse_args()
-
     try:
-
         if args.compare:
-
-            compare_results(
-                args.compare[0],
-                args.compare[1]
-            )
-
+            compare_results(*args.compare)
         else:
-
-            if args.runs < 1:
-                parser.error("--runs must be at least 1")
-
-            if args.warmups < 0:
-                parser.error("--warmups cannot be negative")
-
-            engine = (
-                args.engine
-                if args.engine
-                else detect_engine()
-            )
-
-            output = args.output
-
-            if not output:
-                output = default_output_filename(engine)
-
-            run_suite(
-                engine=engine,
-                runs=args.runs,
-                warmups=args.warmups,
-                output=output,
-                kiri_cli=args.kiri_cli
-            )
-
-    except (
-        RuntimeError,
-        FileNotFoundError,
-        subprocess.TimeoutExpired,
-        OSError,
-        KeyError,
-        ValueError
-    ) as error:
-
-        print(
-            f"\nERROR: {error}",
-            file=sys.stderr
-        )
-
-        sys.exit(1)
+            if args.runs < 1 or args.warmups < 0:
+                parser.error("--runs must be positive and --warmups nonnegative")
+            run_suite(args.engine or detect_engine(), args.runs, args.warmups,
+                      args.output, args.kiri_cli, args.kiri_socket, args.overwrite)
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError,
+            AttributeError, subprocess.TimeoutExpired) as error:
+        print(f"\nERROR: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
