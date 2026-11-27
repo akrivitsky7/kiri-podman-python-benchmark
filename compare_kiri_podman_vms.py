@@ -2,12 +2,15 @@
 # -*- coding: utf-8 -*-
 r"""
 Kiri vs. Podman: Container Lifecycle Performance Benchmark
-Version 1.1.0 | JSON schema 2 | Python 3.10+
+Version 1.2.0 | JSON schema 2 | Python 3.10+
 Author: Anatoly S. Krivitsky, Ph.D.
 
 Run both engines on the same Linux VM for a controlled comparison.
 The original workloads and timing method are retained. No external Python
 packages are required. Internet access is needed for the image pull.
+Engine routing is isolated in child processes; Kiri uses its bundled client
+and explicit socket, and Podman uses its native local mode. Use --verify-only
+for a read-only preflight before benchmarking.
 
 Copyright (c) 2026 Anatoly S. Krivitsky, Ph.D.
 All rights reserved.
@@ -39,7 +42,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-BENCHMARK_VERSION = "1.1.0"
+BENCHMARK_VERSION = "1.2.0"
 SCHEMA_VERSION = 2
 IMAGE = "docker.io/library/alpine:3.22"
 DEFAULT_RUNS = 15
@@ -53,9 +56,25 @@ def warn(message):
     print(f"WARNING: {message}", file=sys.stderr)
 
 
-def execute(command, timeout=COMMAND_TIMEOUT):
+ROUTING_ENV_KEYS = (
+    "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_API_VERSION",
+    "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+    "CONTAINER_HOST", "CONTAINER_CONNECTION",
+)
+
+
+def engine_environment():
+    """Snapshot the child environment without changing the parent shell."""
+    env = os.environ.copy()
+    removed = [key for key in ROUTING_ENV_KEYS if key in env]
+    for key in ROUTING_ENV_KEYS:
+        env.pop(key, None)
+    return env, removed
+
+
+def execute(command, timeout=COMMAND_TIMEOUT, *, env):
     result = subprocess.run(
-        command, capture_output=True, text=True, timeout=timeout, check=False
+        command, capture_output=True, text=True, timeout=timeout, check=False, env=env
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -66,9 +85,9 @@ def execute(command, timeout=COMMAND_TIMEOUT):
     return result
 
 
-def timed_execute(command):
+def timed_execute(command, *, env):
     start = time.perf_counter_ns()
-    execute(command)
+    execute(command, env=env)
     end = time.perf_counter_ns()
     return (end - start) / 1_000_000
 
@@ -86,7 +105,7 @@ def resolve_engine_command(engine, kiri_cli=None, kiri_socket=KIRI_SOCKET):
         executable = shutil.which("podman")
         if not executable:
             raise RuntimeError("Podman executable not found in PATH.")
-        return [executable]
+        return [str(Path(executable).absolute()), "--remote=false"]
     if engine != "kiri":
         raise ValueError(f"Unknown engine: {engine}")
     if not shutil.which("kiri"):
@@ -96,7 +115,7 @@ def resolve_engine_command(engine, kiri_cli=None, kiri_socket=KIRI_SOCKET):
     for candidate in ((kiri_cli,) if kiri_cli else KIRI_CLI_PATHS):
         path = Path(candidate).expanduser()
         if path.is_file() and os.access(path, os.X_OK):
-            return [str(path.resolve()), "-H", f"unix://{kiri_socket}"]
+            return [str(path.absolute()), "-H", f"unix://{kiri_socket}"]
     raise RuntimeError("Kiri's bundled Docker CLI not found or not executable. "
                        "Use --kiri-cli with the genuine bundled client.")
 
@@ -136,13 +155,16 @@ def parse_kiri_version(output):
     }
 
 
-def get_engine_metadata(engine, prefix):
+def get_engine_metadata(engine, prefix, *, env):
     if engine == "kiri":
-        raw = execute(prefix + ["version"], timeout=30).stdout
-        meta = parse_kiri_version(raw)
+        result = execute(prefix + ["version"], timeout=30, env=env)
+        if "emulate docker cli using podman" in result.stderr.casefold():
+            raise RuntimeError("Kiri client resolved to the Podman compatibility wrapper.")
+        meta = parse_kiri_version(result.stdout)
+        meta["verified_identity"] = "Kiri"
         try:
             options = json.loads(execute(
-                prefix + ["info", "--format", "{{json .SecurityOptions}}"], 30
+                prefix + ["info", "--format", "{{json .SecurityOptions}}"], 30, env=env
             ).stdout)
             if isinstance(options, list) and any(
                 "rootless" in str(option).casefold() for option in options
@@ -152,13 +174,17 @@ def get_engine_metadata(engine, prefix):
             pass  # A Docker-compatible server need not implement all info fields.
         return meta
 
-    raw = execute(prefix + ["version", "--format", "json"], 30).stdout
+    identity = execute(prefix + ["--version"], 30, env=env).stdout.strip()
+    if not re.match(r"^podman version\s+\S+", identity, re.IGNORECASE):
+        raise RuntimeError("Executable did not identify itself as Podman.\n" + identity)
+    raw = execute(prefix + ["version", "--format", "json"], 30, env=env).stdout
     data = json.loads(raw)
     client = data.get("Client") or data.get("client") or {}
     server = data.get("Server") or data.get("server") or {}
     client_version = client.get("Version") or client.get("version")
-    server_version = server.get("Version") or server.get("version")
-    version = server_version or client_version
+    if server:
+        raise RuntimeError("Podman reported a separate server despite local mode; refusing to benchmark.")
+    version = client_version
     if not version:
         raise RuntimeError("Podman version missing from JSON response.\n" + raw)
     meta = {
@@ -169,9 +195,10 @@ def get_engine_metadata(engine, prefix):
         "server_api_version": server.get("APIVersion"),
         "rootless": None,
         "version_output": data,
+        "verified_identity": "Podman",
     }
     try:
-        info = json.loads(execute(prefix + ["info", "--format", "json"], 30).stdout)
+        info = json.loads(execute(prefix + ["info", "--format", "json"], 30, env=env).stdout)
         rootless = info.get("host", {}).get("security", {}).get("rootless")
         if isinstance(rootless, bool):
             meta["rootless"] = rootless
@@ -206,12 +233,12 @@ def get_system_information():
     }
 
 
-def inspect_image(prefix):
+def inspect_image(prefix, *, env):
     """Collect identity outside the timed workload; unavailable fields stay null."""
     metadata = {"id": None, "repo_digests": [], "digest": None,
                 "architecture": None, "os": None}
     try:
-        data = json.loads(execute(prefix + ["image", "inspect", IMAGE], 30).stdout)
+        data = json.loads(execute(prefix + ["image", "inspect", IMAGE], 30, env=env).stdout)
         item = data[0] if isinstance(data, list) else data
         metadata.update({
             "id": item.get("Id") or item.get("ID"),
@@ -244,14 +271,14 @@ def calculate_statistics(times):
     }
 
 
-def benchmark(name, command, warmups, runs):
+def benchmark(name, command, warmups, runs, *, env):
     print(f"\n{'=' * 65}\nBenchmark: {name}\nCommand: {shlex.join(command)}")
     for i in range(warmups):
-        timed_execute(command)
+        timed_execute(command, env=env)
         print(f"  Warm-up {i + 1}/{warmups}: OK")
     samples = []
     for i in range(runs):
-        elapsed = timed_execute(command)
+        elapsed = timed_execute(command, env=env)
         samples.append(elapsed)
         print(f"  Run {i + 1:2d}/{runs}: {elapsed:10.3f} ms")
     stats = calculate_statistics(samples)
@@ -262,10 +289,29 @@ def benchmark(name, command, warmups, runs):
     return stats
 
 
+def preflight(engine, kiri_cli=None, kiri_socket=KIRI_SOCKET):
+    prefix = resolve_engine_command(engine, kiri_cli, kiri_socket)
+    env, removed = engine_environment()
+    meta = get_engine_metadata(engine, prefix, env=env)
+    execute(prefix + ["ps"], timeout=30, env=env)
+    routing = {
+        "mode": "explicit_unix_socket" if engine == "kiri" else "native_local",
+        "identity_verified": True,
+        "cleared_environment_variables": removed,
+    }
+    if engine == "kiri":
+        print("Verified: Docker-compatible server is Kiri.")
+    else:
+        print("Verified: Podman CLI in native local mode.")
+    print(f"Engine version: {meta['engine_version']}")
+    print(f"CLI: {shlex.join(prefix)}")
+    print(f"Ignored routing variables: {', '.join(removed) or 'none'}")
+    return prefix, meta, env, routing
+
+
 def run_suite(engine, runs, warmups, output=None, kiri_cli=None,
               kiri_socket=KIRI_SOCKET, overwrite=False):
-    prefix = resolve_engine_command(engine, kiri_cli, kiri_socket)
-    meta = get_engine_metadata(engine, prefix)
+    prefix, meta, env, routing = preflight(engine, kiri_cli, kiri_socket)
     system = get_system_information()
     version = meta["engine_version"]
     path = Path(output or default_output_filename(engine, version, system))
@@ -276,22 +322,22 @@ def run_suite(engine, runs, warmups, output=None, kiri_cli=None,
     print(f"Engine: {engine} {version}\nCLI: {shlex.join(prefix)}")
     print(f"System: {system['distribution_pretty_name']} / {system['kernel']}")
     print(f"Image: {IMAGE}\nRuns: {runs}\nWarm-ups: {warmups}")
-    execute(prefix + ["ps"], timeout=30)
     print("\nPreparing image (not timed)...")
-    execute(prefix + ["pull", IMAGE], timeout=600)
-    image_metadata = inspect_image(prefix)
+    execute(prefix + ["pull", IMAGE], timeout=600, env=env)
+    image_metadata = inspect_image(prefix, env=env)
     if meta["rootless"] is None:
         warn("Engine rootless status unavailable; it will be recorded as null.")
     # Keep both original measured commands and their order unchanged.
     commands = {"ps": prefix + ["ps"],
                 "run": prefix + ["run", "--rm", "--network", "none", IMAGE, "/bin/true"]}
-    ps_results = benchmark("Container listing", commands["ps"], warmups, runs)
-    run_results = benchmark("Container startup and execution", commands["run"], warmups, runs)
+    ps_results = benchmark("Container listing", commands["ps"], warmups, runs, env=env)
+    run_results = benchmark("Container startup and execution", commands["run"], warmups, runs, env=env)
     results = {
         "schema_version": SCHEMA_VERSION, "benchmark_version": BENCHMARK_VERSION,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "engine": engine, "engine_version": version, "engine_metadata": meta,
         "engine_executable": prefix[0], "engine_command_prefix": prefix,
+        "engine_routing": routing,
         "kiri_socket": kiri_socket if engine == "kiri" else None,
         "image": IMAGE, "image_metadata": image_metadata,
         "runs": runs, "warmups": warmups, "system": system,
@@ -345,6 +391,10 @@ def check_comparability(first, second):
     for key in ("runs", "warmups", "benchmark_version"):
         if first.get(key) != second.get(key):
             warn(f"{key} differs: {first.get(key)} vs {second.get(key)}.")
+    for result in (first, second):
+        if (result.get("engine_routing") or {}).get("identity_verified") is not True:
+            warn(f"{result['engine']}: isolated routing verification not recorded; "
+                 "older results remain readable but should be rechecked if routing is uncertain.")
     x = (first.get("engine_metadata") or {}).get("rootless")
     y = (second.get("engine_metadata") or {}).get("rootless")
     if x is None or y is None:
@@ -383,11 +433,17 @@ def main():
     parser.add_argument("--warmups", type=int, default=DEFAULT_WARMUPS)
     parser.add_argument("--output", help="Output JSON filename")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing results")
-    parser.add_argument("--compare", nargs=2, metavar=("FIRST_JSON", "SECOND_JSON"))
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--compare", nargs=2, metavar=("FIRST_JSON", "SECOND_JSON"))
+    mode.add_argument("--verify-only", action="store_true",
+                      help="Verify engine identity and listing; no pull, timing or JSON output")
     args = parser.parse_args()
     try:
         if args.compare:
             compare_results(*args.compare)
+        elif args.verify_only:
+            preflight(args.engine or detect_engine(), args.kiri_cli, args.kiri_socket)
+            print("Preflight completed; no images pulled or benchmarks run.")
         else:
             if args.runs < 1 or args.warmups < 0:
                 parser.error("--runs must be positive and --warmups nonnegative")
